@@ -18,7 +18,10 @@ Reference: transformers 4.57 `Olmo3Model.rotary_embs`, which builds
 the config-scaled one for `full_attention`.
 """
 
+import math
+
 import numpy as np
+import pytest
 
 from easydel.modules.olmo3.olmo3_configuration import Olmo3Config
 
@@ -45,10 +48,8 @@ def _config(rope_scaling: dict | None = None) -> Olmo3Config:
         sliding_window=8,
     )
     if rope_scaling is not None:
-        # Assigned after construction: `_rope_scaling_validation` still accepts only
-        # "linear" and "dynamic", while the released OLMo 3 checkpoints declare
-        # "yarn". That validator is a separate fix; this test covers the routing.
         config.rope_scaling = dict(rope_scaling)
+        config._rope_scaling_validation()
     return config
 
 
@@ -87,3 +88,62 @@ def test_layer_types_select_the_frequency_cache():
         "sliding_attention",
         "full_attention",
     ]
+
+
+def test_released_yarn_config_is_accepted():
+    """`allenai/Olmo-3-7B-Think` ships rope_type "yarn"; it must construct."""
+    config = Olmo3Config(
+        vocab_size=256,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        max_position_embeddings=65_536,
+        rope_theta=500_000.0,
+        sliding_window=8,
+        rope_scaling={
+            "attention_factor": 1.2079441541679836,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+            "factor": 8.0,
+            "original_max_position_embeddings": 8192,
+            "rope_type": "yarn",
+        },
+    )
+    assert config.rope_scaling["rope_type"] == "yarn"
+
+
+def test_hf_attention_factor_becomes_a_residual_attn_factor():
+    """EasyDeL multiplies its own mscale by `attn_factor`, so divide it out.
+
+    The released config's attention_factor is exactly HuggingFace's default
+    `0.1 * ln(factor) + 1`, which is the same mscale EasyDeL infers, so the
+    residual is 1.0 — forwarding 1.2079 unchanged would square the scale.
+    """
+    config = _config(
+        {"rope_type": "yarn", "factor": 8.0, "attention_factor": 1.2079441541679836}
+    )
+    assert config.rope_scaling["attn_factor"] == pytest.approx(1.0, abs=1e-9)
+    # The original key survives so the config still round-trips.
+    assert config.rope_scaling["attention_factor"] == 1.2079441541679836
+
+
+def test_custom_attention_factor_survives_the_conversion():
+    """A hand-tuned attention factor keeps its ratio to the inferred mscale."""
+    inferred = 0.1 * math.log(8.0) + 1.0
+    config = _config({"rope_type": "yarn", "factor": 8.0, "attention_factor": 2 * inferred})
+    assert config.rope_scaling["attn_factor"] == pytest.approx(2.0)
+
+
+def test_explicit_attn_factor_is_left_alone():
+    """A config written for EasyDeL already carries the residual factor."""
+    config = _config(
+        {"rope_type": "yarn", "factor": 8.0, "attention_factor": 1.2, "attn_factor": 0.5}
+    )
+    assert config.rope_scaling["attn_factor"] == 0.5
+
+
+def test_unknown_rope_type_is_still_rejected():
+    with pytest.raises(ValueError, match="type field must be one of"):
+        _config({"rope_type": "banana", "factor": 8.0})
