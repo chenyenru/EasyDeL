@@ -229,6 +229,23 @@ class Olmo3Attention(UnifiedAttention):
             use_qk_norm=True,  # Enable Q/K normalization
         )
 
+    def _create_rotary(self, config: Olmo3Config, dtype: jnp.dtype):
+        if self.attention_type_name != "sliding_attention":
+            return super()._create_rotary(config, dtype)
+
+        from easydel.layers import get_rope
+
+        return get_rope(
+            head_size=int(self.head_dim),
+            rotary_dim=int(self.head_dim),
+            max_position=int(config.granted_freq_max_position_embedding),
+            base=float(config.rope_theta),
+            is_neox_style=True,
+            rope_scaling=None,
+            dtype=dtype,
+            partial_rotary_factor=float(getattr(config, "partial_rotary_factor", 1.0)),
+        )
+
     def _create_q_norm(self, config: Olmo3Config, dtype: jnp.dtype, param_dtype: jnp.dtype, rngs: nn.Rngs):
         """Create query normalization layer using RMSNorm.
 
@@ -540,6 +557,17 @@ class Olmo3Model(EasyDeLBaseModule):
             rngs=rngs,
         )
 
+    @functools.cached_property
+    def sliding_frequencies(self):
+        return self.config.get_unscaled_frequencies()
+
+    def _layer_frequencies(self, layer_idx: int):
+        """Return the frequency cache this layer's attention type was trained with."""
+        layer_types = getattr(self.config, "layer_types", None) or ()
+        if layer_idx < len(layer_types) and layer_types[layer_idx] == "sliding_attention":
+            return self.sliding_frequencies
+        return self.frequencies
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq_len"] | None = None,
@@ -654,7 +682,7 @@ class Olmo3Model(EasyDeLBaseModule):
                 cache_view=past_key_values.views[idx],
                 cache_metadata=cache_metadata,
                 output_attentions=output_attentions,
-                frequencies=self.frequencies,
+                frequencies=self._layer_frequencies(idx),
             )
             hidden_states = layer_outputs.hidden_states
 

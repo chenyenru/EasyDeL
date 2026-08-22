@@ -13,6 +13,7 @@
 # limitations under the License.
 
 
+import math
 import typing
 
 from jax.sharding import PartitionSpec
@@ -107,6 +108,7 @@ class Olmo3Config(EasyDeLBaseConfig):
 
     model_type = "olmo3"
     keys_to_ignore_at_inference: typing.ClassVar = ["past_key_values"]
+    SUPPORTED_ROPE_SCALING_TYPES: typing.ClassVar[tuple[str, ...]] = ("linear", "dynamic", "yarn")
 
     def __init__(
         self,
@@ -216,9 +218,16 @@ class Olmo3Config(EasyDeLBaseConfig):
     def _rope_scaling_validation(self):
         """
         Validates the `rope_scaling` configuration dictionary to ensure it meets the expected format and values.
+
+        Released OLMo 3 checkpoints (`allenai/Olmo-3-7B-Think` and friends) ship
+        `rope_type: "yarn"`, which `easydel.layers.rotary` implements, so the type
+        is accepted here and its HuggingFace attention factor is converted to the
+        residual one EasyDeL expects.
+
         Raises:
                 ValueError: If `rope_scaling` is not a dictionary with the correct fields (`type`, `factor`)
-                        or if the values are invalid (type not 'linear' or 'dynamic', factor not a float > 1.0).
+                        or if the values are invalid (type not one of `SUPPORTED_ROPE_SCALING_TYPES`,
+                        factor not a float > 1.0).
         """
         if self.rope_scaling is None:
             return
@@ -235,12 +244,45 @@ class Olmo3Config(EasyDeLBaseConfig):
             return
 
         rope_scaling_factor = self.rope_scaling.get("factor", None)
-        if rope_scaling_type is None or rope_scaling_type not in ["linear", "dynamic"]:
+        if rope_scaling_type not in self.SUPPORTED_ROPE_SCALING_TYPES:
             raise ValueError(
-                f"`rope_scaling`'s type field must be one of ['linear', 'dynamic'], got {rope_scaling_type}"
+                f"`rope_scaling`'s type field must be one of {list(self.SUPPORTED_ROPE_SCALING_TYPES)}, "
+                f"got {rope_scaling_type}"
             )
         if rope_scaling_factor is None or not isinstance(rope_scaling_factor, float) or rope_scaling_factor <= 1.0:
             raise ValueError(f"`rope_scaling`'s factor field must be a float > 1, got {rope_scaling_factor}")
+
+        if rope_scaling_type == "yarn":
+            self.rope_scaling = self._with_residual_yarn_attention_factor(self.rope_scaling)
+
+    @staticmethod
+    def _with_residual_yarn_attention_factor(rope_scaling: dict) -> dict:
+        """Translate HuggingFace's total YaRN multiplier into EasyDeL's residual one.
+
+        Transformers stores `attention_factor` as the complete multiplier applied to
+        the rotary cache. `compute_yarn_frequencies` instead multiplies its own
+        `_yarn_get_mscale(factor)` by `attn_factor`, so forwarding the HuggingFace
+        value unchanged would apply the scale twice. Divide the inferred mscale out
+        and record the remainder as `attn_factor`; the original key is preserved so
+        the config still round-trips. A config that already carries `attn_factor` is
+        assumed to be written for EasyDeL and is left alone.
+        """
+        if "attention_factor" not in rope_scaling or "attn_factor" in rope_scaling:
+            return rope_scaling
+
+        attention_factor = float(rope_scaling["attention_factor"])
+        if not math.isfinite(attention_factor) or attention_factor <= 0:
+            raise ValueError(
+                f"`rope_scaling`'s attention_factor must be finite and positive, got {attention_factor}"
+            )
+
+        factor = float(rope_scaling.get("factor", 1.0))
+        # Mirrors easydel.layers.rotary._utils._yarn_get_mscale.
+        mscale = 0.1 * math.log(factor) + 1.0 if factor > 1 else 1.0
+
+        normalized = dict(rope_scaling)
+        normalized["attn_factor"] = attention_factor / mscale
+        return normalized
 
     def _validate_layer_types(self):
         """

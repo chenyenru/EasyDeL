@@ -2685,6 +2685,49 @@ class EasyDeLBaseConfig(PretrainedConfig):
 
         return ModuleCaches(jax.device_put(frequencies, Ns(self.mesh, Ps())))
 
+    def get_unscaled_frequencies(
+        self,
+        head_size: int | None = None,
+        rotary_dim: int | None = None,
+        base: float | None = None,
+    ) -> ModuleCaches:
+        """Compute RoPE frequencies with ``rope_scaling`` ignored.
+
+        Some architectures mix scaled and unscaled RoPE within one model.
+        e.g., OLMo 3, applies YaRN scaling to full-attention layers
+        but not for sliding-attention layers.
+        Need a separate cache from ``rope_theta`` that sets scaling to ``None``.
+
+        Args:
+            head_size (int, optional): Attention head dimension size.
+                Defaults to `self.head_dim`.
+            rotary_dim (int, optional): Number of dimensions for rotary embeddings.
+                Defaults to `head_size`.
+            base (float, optional): Base frequency value. Defaults to `self.rope_theta`.
+
+        Returns:
+            ModuleCaches: Container wrapping the frequency tensor, placed on the
+                device mesh exactly like `get_basic_frequencies`.
+        """
+        from easydel.layers import get_frequencies
+
+        from .utils import ModuleCaches
+
+        partial_rotary_factor = getattr(self, "partial_rotary_factor", 1.0)
+        head_size = head_size or self.head_dim
+        rotary_dim = rotary_dim or head_size
+
+        frequencies = get_frequencies(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position=self.granted_freq_max_position_embedding,
+            base=base or self.rope_theta,
+            rope_scaling=None,
+            partial_rotary_factor=partial_rotary_factor,
+        ).astype(jnp.bfloat16)
+
+        return ModuleCaches(jax.device_put(frequencies, Ns(self.mesh, Ps())))
+
     @staticmethod
     def _create_causal_mask(target_length):
         """Create a causal attention mask for autoregressive models.
